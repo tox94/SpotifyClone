@@ -1,0 +1,751 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1920, initial-scale=1">
+<title>Titan OS Playback Probe</title>
+<style>
+  :root {
+    --bg: #121212;
+    --panel: #1e1e1e;
+    --panel-2: #2a2a2a;
+    --text: #ffffff;
+    --muted: #b3b3b3;
+    --green: #1ed760;
+    --red: #f15e6c;
+    --amber: #ffa42b;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-size: 24px;
+  }
+  /* ~5% overscan-safe margins for TV panels */
+  main { padding: 48px 96px 96px; }
+  h1 { font-size: 44px; margin: 0 0 20px; }
+  h2 {
+    font-size: 24px;
+    margin: 0 0 12px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  section {
+    background: var(--panel);
+    border-radius: 12px;
+    padding: 24px 28px;
+    margin-top: 24px;
+  }
+  .verdict {
+    padding: 20px 28px;
+    border-radius: 12px;
+    font-size: 30px;
+    font-weight: 700;
+    background: var(--panel-2);
+  }
+  .verdict.ok { background: #0f3d22; color: var(--green); }
+  .verdict.warn { background: #3d2a0f; color: var(--amber); }
+  .verdict.bad { background: #3d0f15; color: var(--red); }
+  nav { margin-top: 24px; }
+  button {
+    font: inherit;
+    font-weight: 700;
+    padding: 16px 28px;
+    margin: 0 12px 12px 0;
+    border-radius: 999px;
+    border: 3px solid transparent;
+    background: var(--panel-2);
+    color: var(--text);
+  }
+  button:focus {
+    outline: none;
+    border-color: var(--text);
+    background: var(--green);
+    color: #000;
+  }
+  button:disabled { opacity: 0.35; }
+  table { width: 100%; border-collapse: collapse; }
+  td {
+    padding: 8px 12px;
+    border-top: 1px solid #333;
+    vertical-align: top;
+    word-break: break-word;
+  }
+  td:first-child { color: var(--muted); width: 36%; }
+  .ok { color: var(--green); }
+  .warn { color: var(--amber); }
+  .bad { color: var(--red); }
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-gap: 24px;
+  }
+  #spotify-status { font-weight: 700; }
+  #spotify-log {
+    font-family: Menlo, Consolas, monospace;
+    font-size: 20px;
+    color: var(--muted);
+    max-height: 280px;
+    overflow: auto;
+    margin: 12px 0 0;
+    padding-left: 32px;
+  }
+  #spotify-log li { margin-bottom: 4px; }
+  .hint { color: var(--muted); margin: 0 0 8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Titan OS Playback Probe</h1>
+  <div id="verdict" class="verdict">Running checks…</div>
+
+  <nav id="actions">
+    <button id="btn-rerun">Re-run checks</button>
+    <button id="btn-login">Spotify: log in</button>
+    <button id="btn-start">Spotify: start player</button>
+    <button id="btn-play" disabled>Play on this TV</button>
+    <button id="btn-logout">Spotify: log out</button>
+  </nav>
+
+  <section>
+    <h2>Spotify live test</h2>
+    <div id="spotify-status"></div>
+    <ol id="spotify-log"></ol>
+  </section>
+
+  <section>
+    <h2>DRM (EME)</h2>
+    <table id="drm"></table>
+  </section>
+
+  <div class="grid">
+    <section>
+      <h2>Audio codecs</h2>
+      <table id="codecs"></table>
+    </section>
+    <section>
+      <h2>Autoplay</h2>
+      <table id="autoplay"></table>
+    </section>
+  </div>
+
+  <div class="grid">
+    <section>
+      <h2>Device</h2>
+      <table id="device"></table>
+    </section>
+    <section>
+      <h2>Remote keys</h2>
+      <p class="hint">Press any remote button to see its key code.</p>
+      <table id="keys"></table>
+    </section>
+  </div>
+</main>
+
+<script>
+// Plain ES2017 on purpose: older Philips models run an older Chromium.
+(function () {
+  'use strict';
+
+  var SPOTIFY_SCOPES = [
+    'streaming',
+    'user-read-email',
+    'user-read-private',
+    'user-read-playback-state',
+    'user-modify-playback-state',
+    'user-read-recently-played'
+  ].join(' ');
+  var STORAGE_PREFIX = 'titanProbe.';
+  var AAC = 'audio/mp4; codecs="mp4a.40.2"';
+  var AUDIO_TYPES = [
+    AAC,
+    'audio/mp4; codecs="flac"',
+    'audio/webm; codecs="opus"',
+    'audio/webm; codecs="vorbis"'
+  ];
+  var PLAIN_AUDIO_TYPES = AUDIO_TYPES.concat(['audio/mpeg', 'audio/ogg; codecs="vorbis"']);
+  var WIDEVINE_ROBUSTNESS = ['SW_SECURE_CRYPTO', 'SW_SECURE_DECODE', 'HW_SECURE_CRYPTO', 'HW_SECURE_DECODE', 'HW_SECURE_ALL'];
+  var KEY_SYSTEMS = [
+    { id: 'com.widevine.alpha', name: 'Widevine', initData: widevineInitData },
+    { id: 'com.microsoft.playready.recommendation', name: 'PlayReady (recommendation)' },
+    { id: 'com.microsoft.playready', name: 'PlayReady' },
+    { id: 'com.youtube.playready', name: 'PlayReady (YouTube)' },
+    { id: 'org.w3.clearkey', name: 'ClearKey', initData: clearKeyInitData }
+  ];
+
+  var results = { device: {}, eme: null, drm: {}, codecs: {}, autoplay: {}, spotify: { status: 'not started' } };
+  window.titanProbeResults = results;
+
+  // ---------- helpers ----------
+
+  function $(id) { return document.getElementById(id); }
+
+  function load(key) {
+    try { return localStorage.getItem(STORAGE_PREFIX + key); } catch (e) { return null; }
+  }
+
+  function save(key, value) {
+    try {
+      if (value == null) localStorage.removeItem(STORAGE_PREFIX + key);
+      else localStorage.setItem(STORAGE_PREFIX + key, value);
+    } catch (e) { /* storage blocked: login just won't persist */ }
+  }
+
+  function clearTable(id) { $(id).innerHTML = ''; }
+
+  function addRow(tableId, label, value, tone) {
+    var tr = document.createElement('tr');
+    var name = document.createElement('td');
+    var cell = document.createElement('td');
+    name.textContent = label;
+    cell.textContent = value;
+    if (tone) cell.className = tone;
+    tr.appendChild(name);
+    tr.appendChild(cell);
+    $(tableId).appendChild(tr);
+  }
+
+  function yesNo(v) { return v ? 'yes' : 'no'; }
+
+  function errText(e) {
+    if (!e) return 'unknown error';
+    return (e.name && e.name !== 'Error' ? e.name + ': ' : '') + (e.message || String(e));
+  }
+
+  function withTimeout(promise, ms, label) {
+    return new Promise(function (resolve, reject) {
+      var timer = setTimeout(function () { reject(new Error(label + ' timed out after ' + ms + ' ms')); }, ms);
+      promise.then(
+        function (v) { clearTimeout(timer); resolve(v); },
+        function (e) { clearTimeout(timer); reject(e); }
+      );
+    });
+  }
+
+  function shortType(type) {
+    var codec = /codecs="([^"]+)"/.exec(type);
+    var container = type.split(';')[0].replace('audio/', '');
+    return codec ? container + '/' + codec[1] : container;
+  }
+
+  function hexBytes(hex) {
+    var out = new Uint8Array(hex.length / 2);
+    for (var i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+    return out;
+  }
+
+  function base64url(buffer) {
+    var bytes = new Uint8Array(buffer);
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  function randomString(length) {
+    var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    var bytes = crypto.getRandomValues(new Uint8Array(length));
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) s += chars[bytes[i] % chars.length];
+    return s;
+  }
+
+  var TEST_KEY_ID = hexBytes('0102030405060708090a0b0c0d0e0f10');
+
+  // Minimal Widevine 'pssh' box with one key id. A working CDM answers it with a license request.
+  function widevineInitData() {
+    var systemId = hexBytes('edef8ba979d64acea3c827dcd51d21ed');
+    var data = new Uint8Array(2 + TEST_KEY_ID.length);
+    data[0] = 0x12; // protobuf field 2 (key_id), length-delimited
+    data[1] = TEST_KEY_ID.length;
+    data.set(TEST_KEY_ID, 2);
+    var box = new Uint8Array(32 + data.length);
+    var view = new DataView(box.buffer);
+    view.setUint32(0, box.length);
+    box.set([0x70, 0x73, 0x73, 0x68], 4); // 'pssh'
+    view.setUint32(8, 0); // version 0, no flags
+    box.set(systemId, 12);
+    view.setUint32(28, data.length);
+    box.set(data, 32);
+    return { type: 'cenc', data: box };
+  }
+
+  function clearKeyInitData() {
+    var json = JSON.stringify({ kids: [base64url(TEST_KEY_ID)] });
+    return { type: 'keyids', data: new TextEncoder().encode(json) };
+  }
+
+  // 0.25 s of 8 kHz silence, used to see whether unmuted play() is allowed without a key press.
+  function silentWavUrl() {
+    var rate = 8000, samples = 2000;
+    var view = new DataView(new ArrayBuffer(44 + samples));
+    function str(offset, s) { for (var i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i)); }
+    str(0, 'RIFF'); view.setUint32(4, 36 + samples, true); str(8, 'WAVE');
+    str(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+    view.setUint32(24, rate, true); view.setUint32(28, rate, true); view.setUint16(32, 1, true); view.setUint16(34, 8, true);
+    str(36, 'data'); view.setUint32(40, samples, true);
+    for (var i = 0; i < samples; i++) view.setUint8(44 + i, 128);
+    return URL.createObjectURL(new Blob([view.buffer], { type: 'audio/wav' }));
+  }
+
+  // ---------- capability checks ----------
+
+  function storageWorks() {
+    try {
+      localStorage.setItem(STORAGE_PREFIX + 'test', '1');
+      localStorage.removeItem(STORAGE_PREFIX + 'test');
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function checkDevice() {
+    clearTable('device');
+    var ua = navigator.userAgent;
+    var chromium = /Chrom(?:e|ium)\/([\d.]+)/.exec(ua);
+    var d = results.device = {
+      userAgent: ua,
+      chromium: chromium ? chromium[1] : null,
+      screen: screen.width + '×' + screen.height,
+      viewport: window.innerWidth + '×' + window.innerHeight,
+      devicePixelRatio: window.devicePixelRatio,
+      secureContext: window.isSecureContext,
+      localStorage: storageWorks(),
+      language: navigator.language,
+      cpuCores: navigator.hardwareConcurrency || null,
+      memoryGB: navigator.deviceMemory || null
+    };
+    addRow('device', 'Chromium', d.chromium || 'not detected', d.chromium ? null : 'warn');
+    addRow('device', 'Secure context (HTTPS)', yesNo(d.secureContext), d.secureContext ? 'ok' : 'bad');
+    addRow('device', 'localStorage', yesNo(d.localStorage), d.localStorage ? 'ok' : 'warn');
+    addRow('device', 'Screen / viewport', d.screen + ' / ' + d.viewport + ' @' + d.devicePixelRatio + 'x');
+    addRow('device', 'CPU cores / memory', (d.cpuCores || '?') + ' / ' + (d.memoryGB ? d.memoryGB + ' GB' : '?'));
+    addRow('device', 'Language', d.language);
+    addRow('device', 'User agent', ua);
+  }
+
+  async function probeCdm(ks, access) {
+    var keys = await withTimeout(access.createMediaKeys(), 5000, 'createMediaKeys');
+    if (!ks.initData) return 'MediaKeys created';
+    var session = keys.createSession('temporary');
+    var init = ks.initData();
+    var gotMessage = new Promise(function (resolve) { session.addEventListener('message', resolve); });
+    await withTimeout(Promise.all([session.generateRequest(init.type, init.data), gotMessage]), 5000, 'License request');
+    session.close().catch(function () {});
+    return 'license request generated';
+  }
+
+  async function probeKeySystem(ks) {
+    var r = { supported: false, audio: [], cdm: 'not tested' };
+    results.drm[ks.id] = r;
+    var caps = AUDIO_TYPES.map(function (t) { return { contentType: t, robustness: '' }; });
+    try {
+      var access = await navigator.requestMediaKeySystemAccess(ks.id, [
+        { initDataTypes: ['cenc'], audioCapabilities: caps },
+        { audioCapabilities: caps }
+      ]);
+      r.supported = true;
+      r.audio = access.getConfiguration().audioCapabilities.map(function (c) { return c.contentType; });
+    } catch (e) {
+      r.error = errText(e);
+      return r;
+    }
+    try {
+      r.cdm = await probeCdm(ks, access);
+    } catch (e) {
+      r.cdm = 'failed: ' + errText(e);
+    }
+    return r;
+  }
+
+  async function probeWidevineRobustness() {
+    var supported = [];
+    for (var i = 0; i < WIDEVINE_ROBUSTNESS.length; i++) {
+      try {
+        await navigator.requestMediaKeySystemAccess('com.widevine.alpha', [
+          { audioCapabilities: [{ contentType: AAC, robustness: WIDEVINE_ROBUSTNESS[i] }] }
+        ]);
+        supported.push(WIDEVINE_ROBUSTNESS[i]);
+      } catch (e) { /* level not available */ }
+    }
+    return supported;
+  }
+
+  async function checkDrm() {
+    clearTable('drm');
+    results.drm = {};
+    results.eme = !!navigator.requestMediaKeySystemAccess;
+    if (!results.eme) {
+      addRow('drm', 'EME API', window.isSecureContext ? 'missing on this browser' : 'missing (page is not served over HTTPS)', 'bad');
+      return;
+    }
+    for (var i = 0; i < KEY_SYSTEMS.length; i++) {
+      var ks = KEY_SYSTEMS[i];
+      var r = await probeKeySystem(ks);
+      if (!r.supported) {
+        addRow('drm', ks.name, 'not supported' + (r.error ? ' (' + r.error + ')' : ''), ks.id === 'com.widevine.alpha' ? 'bad' : null);
+        continue;
+      }
+      var audio = r.audio.map(shortType).join(', ') || 'no audio types';
+      addRow('drm', ks.name, 'supported · ' + audio + ' · CDM: ' + r.cdm, /^failed/.test(r.cdm) ? 'warn' : 'ok');
+    }
+    if (results.drm['com.widevine.alpha'].supported) {
+      var levels = results.drm['com.widevine.alpha'].robustness = await probeWidevineRobustness();
+      addRow('drm', 'Widevine robustness (AAC)', levels.join(', ') || 'none of the named levels', levels.length ? 'ok' : 'warn');
+    }
+  }
+
+  function checkCodecs() {
+    clearTable('codecs');
+    results.codecs = {};
+    var audio = document.createElement('audio');
+    var mse = window.MediaSource || window.ManagedMediaSource || window.WebKitMediaSource;
+    if (!mse) addRow('codecs', 'MediaSource (MSE)', 'missing', 'bad');
+    PLAIN_AUDIO_TYPES.forEach(function (t) {
+      var plain = audio.canPlayType(t) || 'no';
+      var viaMse = !!(mse && mse.isTypeSupported && mse.isTypeSupported(t));
+      results.codecs[t] = { canPlayType: plain, mse: viaMse };
+      addRow('codecs', shortType(t), 'element: ' + plain + ' · MSE: ' + yesNo(viaMse), viaMse ? 'ok' : (plain !== 'no' ? 'warn' : 'bad'));
+    });
+  }
+
+  async function checkAutoplay() {
+    clearTable('autoplay');
+    var a = results.autoplay = {};
+    if (navigator.getAutoplayPolicy) {
+      a.policy = navigator.getAutoplayPolicy('mediaelement');
+      addRow('autoplay', 'Autoplay policy', a.policy, a.policy === 'allowed' ? 'ok' : 'warn');
+    }
+    var Ctx = window.AudioContext || window.webkitAudioContext;
+    if (Ctx) {
+      var ctx = new Ctx();
+      a.audioContextState = ctx.state;
+      addRow('autoplay', 'AudioContext on load', ctx.state, ctx.state === 'running' ? 'ok' : 'warn');
+      if (ctx.close) ctx.close();
+    }
+    var el = new Audio(silentWavUrl());
+    try {
+      await withTimeout(el.play(), 3000, 'play()');
+      el.pause();
+      a.unmutedPlay = 'allowed';
+      addRow('autoplay', 'Sound before any key press', 'allowed', 'ok');
+    } catch (e) {
+      a.unmutedPlay = errText(e);
+      addRow('autoplay', 'Sound before any key press', 'blocked (' + errText(e) + '). Fine: the player starts on a key press.', 'warn');
+    }
+  }
+
+  function updateVerdict() {
+    var wv = results.drm['com.widevine.alpha'];
+    var s = results.spotify;
+    var tone, text;
+    if (s.status === 'playing') {
+      tone = 'ok';
+      text = 'Spotify plays on this TV. The full app can play audio itself.';
+    } else if (s.status === 'failed') {
+      tone = 'bad';
+      text = 'Spotify player failed: ' + s.error;
+    } else if (results.eme === null) {
+      tone = '';
+      text = 'Running checks…';
+    } else if (!results.eme) {
+      tone = 'bad';
+      text = window.isSecureContext
+        ? 'This browser has no DRM support. Spotify cannot play in a web app here.'
+        : 'DRM cannot be tested: open this page over HTTPS.';
+    } else if (!wv || !wv.supported) {
+      tone = 'bad';
+      text = 'No Widevine. The Spotify Web Playback SDK will very likely not play here, so the app would have to work as a remote control.';
+    } else if (/^failed/.test(wv.cdm)) {
+      tone = 'warn';
+      text = 'Widevine is listed but did not start properly. Run the Spotify live test to be sure.';
+    } else if (wv.audio.indexOf(AAC) === -1) {
+      tone = 'warn';
+      text = 'Widevine is present but not for AAC audio. Run the Spotify live test to be sure.';
+    } else {
+      tone = 'ok';
+      text = 'Widevine works for AAC audio, so Spotify should play. Run the Spotify live test to confirm.';
+    }
+    $('verdict').className = 'verdict ' + tone;
+    $('verdict').textContent = text;
+  }
+
+  async function runChecks() {
+    results.eme = null;
+    updateVerdict();
+    checkDevice();
+    checkCodecs();
+    await checkDrm();
+    updateVerdict();
+    await checkAutoplay();
+    console.log('TITAN_PROBE_RESULTS ' + JSON.stringify(results));
+  }
+
+  // ---------- Spotify live test ----------
+
+  var params = new URLSearchParams(location.search);
+  if (params.get('client_id')) save('clientId', params.get('client_id'));
+  var clientId = load('clientId');
+  var redirectUri = location.origin + location.pathname;
+  var player = null;
+  var deviceId = null;
+
+  function slog(message, tone) {
+    var li = document.createElement('li');
+    li.textContent = new Date().toLocaleTimeString() + '  ' + message;
+    if (tone) li.className = tone;
+    $('spotify-log').appendChild(li);
+    $('spotify-log').scrollTop = $('spotify-log').scrollHeight;
+    console.log('[spotify] ' + message);
+  }
+
+  function renderSpotifyStatus() {
+    $('spotify-status').textContent = [
+      'Client ID: ' + (clientId ? 'set' : 'missing (add ?client_id=… to the URL)'),
+      'Logged in: ' + yesNo(load('refreshToken')),
+      'Player: ' + results.spotify.status
+    ].join('   ·   ');
+  }
+
+  function setSpotifyStatus(status, error) {
+    results.spotify.status = status;
+    results.spotify.error = error || null;
+    renderSpotifyStatus();
+    updateVerdict();
+  }
+
+  async function tokenRequest(body) {
+    var res = await fetch('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams(body).toString()
+    });
+    var json = await res.json();
+    if (!res.ok) throw new Error(json.error_description || json.error || 'HTTP ' + res.status);
+    save('accessToken', json.access_token);
+    save('expiresAt', String(Date.now() + json.expires_in * 1000));
+    if (json.refresh_token) save('refreshToken', json.refresh_token);
+  }
+
+  async function getToken() {
+    if (load('accessToken') && Number(load('expiresAt')) - Date.now() > 60000) return load('accessToken');
+    var refresh = load('refreshToken');
+    if (!refresh) throw new Error('not logged in');
+    await tokenRequest({ grant_type: 'refresh_token', refresh_token: refresh, client_id: clientId });
+    return load('accessToken');
+  }
+
+  async function api(method, path, body) {
+    var res = await fetch('https://api.spotify.com/v1' + path, {
+      method: method,
+      headers: { Authorization: 'Bearer ' + await getToken(), 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined
+    });
+    var text = await res.text();
+    var json = null;
+    try { json = text ? JSON.parse(text) : null; } catch (e) { /* empty or non-JSON success body */ }
+    if (!res.ok) throw new Error((json && json.error && json.error.message) || 'HTTP ' + res.status);
+    return json;
+  }
+
+  // Authorization Code with PKCE: no client secret, so no backend is needed for this probe.
+  async function login() {
+    if (!clientId) {
+      slog('Add ?client_id=YOUR_SPOTIFY_CLIENT_ID to this page\'s URL first.', 'bad');
+      return;
+    }
+    var verifier = randomString(64);
+    var challenge = base64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+    var state = randomString(16);
+    save('verifier', verifier);
+    save('state', state);
+    var query = new URLSearchParams({
+      response_type: 'code',
+      client_id: clientId,
+      scope: SPOTIFY_SCOPES,
+      redirect_uri: redirectUri,
+      code_challenge_method: 'S256',
+      code_challenge: challenge,
+      state: state
+    });
+    location.assign('https://accounts.spotify.com/authorize?' + query.toString());
+  }
+
+  async function handleRedirect() {
+    var code = params.get('code');
+    var error = params.get('error');
+    if (!code && !error) return;
+    var clean = new URLSearchParams(location.search);
+    ['code', 'state', 'error'].forEach(function (k) { clean.delete(k); });
+    history.replaceState(null, '', location.pathname + (clean.toString() ? '?' + clean.toString() : ''));
+    if (error) throw new Error('Spotify returned "' + error + '"');
+    if (params.get('state') !== load('state')) throw new Error('state mismatch, try logging in again');
+    await tokenRequest({
+      grant_type: 'authorization_code',
+      code: code,
+      redirect_uri: redirectUri,
+      client_id: clientId,
+      code_verifier: load('verifier')
+    });
+    save('verifier', null);
+    save('state', null);
+    slog('Logged in to Spotify.', 'ok');
+  }
+
+  function loadSdk() {
+    if (window.Spotify) return Promise.resolve();
+    return new Promise(function (resolve, reject) {
+      window.onSpotifyWebPlaybackSDKReady = resolve;
+      var script = document.createElement('script');
+      script.src = 'https://sdk.scdn.co/spotify-player.js';
+      script.onerror = function () { reject(new Error('could not load the Spotify SDK script')); };
+      document.head.appendChild(script);
+    });
+  }
+
+  async function startPlayer() {
+    if (player) { slog('Player already started.'); return; }
+    try { await getToken(); } catch (e) { slog('Log in first (' + errText(e) + ').', 'bad'); return; }
+    setSpotifyStatus('starting');
+    try {
+      await withTimeout(loadSdk(), 15000, 'Loading the Spotify SDK');
+    } catch (e) {
+      slog(errText(e), 'bad');
+      setSpotifyStatus('failed', errText(e));
+      return;
+    }
+    player = new window.Spotify.Player({
+      name: 'Titan OS Probe',
+      volume: 0.6,
+      getOAuthToken: function (cb) {
+        getToken().then(cb, function (e) { slog('Token refresh failed: ' + errText(e), 'bad'); });
+      }
+    });
+    player.addListener('ready', function (e) {
+      deviceId = e.device_id;
+      slog('Player ready. "Titan OS Probe" now shows up as a Spotify device.', 'ok');
+      setSpotifyStatus('ready');
+      $('btn-play').disabled = false;
+    });
+    player.addListener('not_ready', function () { slog('Player went offline.', 'warn'); });
+    ['initialization_error', 'authentication_error', 'account_error', 'playback_error'].forEach(function (name) {
+      player.addListener(name, function (e) {
+        slog(name + ': ' + e.message, 'bad');
+        setSpotifyStatus('failed', name + ': ' + e.message);
+      });
+    });
+    player.addListener('autoplay_failed', function () {
+      slog('The TV browser blocked autoplay. Press "Play on this TV" again.', 'warn');
+    });
+    player.addListener('player_state_changed', function (s) {
+      if (!s || !s.track_window || !s.track_window.current_track) return;
+      slog((s.paused ? 'Paused: ' : 'Playing: ') + s.track_window.current_track.name + ' at ' + Math.round(s.position / 1000) + ' s');
+    });
+    var connected = await player.connect();
+    slog(connected ? 'Connecting to Spotify…' : 'player.connect() returned false.', connected ? null : 'bad');
+  }
+
+  async function playHere() {
+    if (!player || !deviceId) return;
+    // Must run inside the key-press handler so the TV browser treats it as a user gesture.
+    if (player.activateElement) await player.activateElement();
+    try {
+      var recent = await api('GET', '/me/player/recently-played?limit=1');
+      var item = recent && recent.items && recent.items[0];
+      if (item) {
+        slog('Starting "' + item.track.name + '" on this TV…');
+        await api('PUT', '/me/player/play?device_id=' + encodeURIComponent(deviceId), { uris: [item.track.uri] });
+      } else {
+        slog('No recently played track, transferring playback instead…');
+        await api('PUT', '/me/player', { device_ids: [deviceId], play: true });
+      }
+    } catch (e) {
+      slog('Play request failed: ' + errText(e), 'bad');
+      return;
+    }
+    watchProgress();
+  }
+
+  // The SDK can report "playing" without decoding anything, so check that the position really advances.
+  function watchProgress() {
+    var start = null;
+    var checks = 0;
+    var timer = setInterval(function () {
+      checks++;
+      player.getCurrentState().then(function (s) {
+        if (s && !s.paused) {
+          if (start === null) start = s.position;
+          else if (s.position - start > 1500) {
+            clearInterval(timer);
+            slog('Audio is decoding (position moved ' + ((s.position - start) / 1000).toFixed(1) + ' s). Can you hear it?', 'ok');
+            setSpotifyStatus('playing');
+            return;
+          }
+        }
+        if (checks >= 12) {
+          clearInterval(timer);
+          slog('Playback did not advance within 12 s, which points to a DRM or decoding problem.', 'bad');
+          setSpotifyStatus('failed', 'playback never advanced');
+        }
+      }).catch(function (e) { slog('getCurrentState failed: ' + errText(e), 'warn'); });
+    }, 1000);
+  }
+
+  function logout() {
+    if (player) player.disconnect();
+    player = null;
+    deviceId = null;
+    $('btn-play').disabled = true;
+    ['accessToken', 'expiresAt', 'refreshToken'].forEach(function (k) { save(k, null); });
+    slog('Logged out.');
+    setSpotifyStatus('not started');
+  }
+
+  // ---------- remote control ----------
+
+  var keyLog = [];
+
+  function onKeyDown(e) {
+    keyLog.unshift({ key: e.key || '?', code: e.code || '?', keyCode: e.keyCode });
+    keyLog = keyLog.slice(0, 6);
+    clearTable('keys');
+    keyLog.forEach(function (k) { addRow('keys', k.key, 'code ' + k.code + ' · keyCode ' + k.keyCode); });
+
+    var buttons = Array.prototype.filter.call(document.querySelectorAll('#actions button'), function (b) { return !b.disabled; });
+    var index = buttons.indexOf(document.activeElement);
+    if (e.keyCode === 37 || e.keyCode === 39) {
+      e.preventDefault();
+      var step = e.keyCode === 39 ? 1 : -1;
+      buttons[index === -1 ? 0 : (index + step + buttons.length) % buttons.length].focus();
+    } else if (e.keyCode === 38 || e.keyCode === 40) {
+      e.preventDefault();
+      window.scrollBy(0, e.keyCode === 40 ? 240 : -240);
+    }
+  }
+
+  function onClick(id, fn) {
+    $(id).addEventListener('click', function () {
+      Promise.resolve(fn()).catch(function (e) { slog(errText(e), 'bad'); });
+    });
+  }
+
+  // ---------- start ----------
+
+  document.addEventListener('keydown', onKeyDown);
+  onClick('btn-rerun', runChecks);
+  onClick('btn-login', login);
+  onClick('btn-start', startPlayer);
+  onClick('btn-play', playHere);
+  onClick('btn-logout', logout);
+
+  renderSpotifyStatus();
+  $('btn-rerun').focus();
+  runChecks();
+  handleRedirect()
+    .catch(function (e) { slog('Login failed: ' + errText(e), 'bad'); })
+    .then(renderSpotifyStatus);
+})();
+</script>
+</body>
+</html>
